@@ -25,11 +25,12 @@ output() {
     --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue"
 }
 
-# Execute une commande sur le serveur via SSM et affiche sa sortie
+# Execute une commande sur le serveur via SSM et affiche sa sortie, convertie en ASCII :
+# l'AWS CLI Windows echoue sur les caracteres hors de sa page de code (erreur 'charmap')
 remote() {
   local command_id
   command_id=$(aws_text ssm send-command --instance-ids "$INSTANCE_ID" --document-name AWS-RunShellScript \
-    --parameters "{\"commands\":[\"$1\"]}" --query Command.CommandId)
+    --parameters "{\"commands\":[\"{ $1 ; } 2>&1 | iconv -f UTF-8 -t ASCII//TRANSLIT -c\"]}" --query Command.CommandId)
   aws ssm wait command-executed --command-id "$command_id" --instance-id "$INSTANCE_ID" || true
   aws_text ssm get-command-invocation --command-id "$command_id" --instance-id "$INSTANCE_ID" \
     --query StandardOutputContent
@@ -57,7 +58,7 @@ case "$1" in
   arreter) aws ec2 stop-instances --instance-ids "$INSTANCE_ID" --query 'StoppingInstances[0].CurrentState.Name' --output text ;;
   page) output ControlPageUrl ;;
   journal)
-    remote "tail -n 40 /var/log/minecraft-setup.log; echo; echo '=== Minecraft ==='; tail -n 40 /opt/minecraft/crafty/servers/*/logs/latest.log"
+    remote "tail -n 40 /var/log/minecraft-setup.log; echo; echo '=== Crafty ==='; systemctl is-active crafty; docker ps -a --format '{{.Names}} {{.Status}}'; echo; echo '=== Minecraft ==='; tail -n 40 /opt/minecraft/crafty/servers/*/logs/latest.log"
     ;;
   reinstaller) aws ssm start-associations-once --association-ids "$(output SetupAssociationId)" && echo "Relance ; suivre avec ./admin.sh journal" ;;
   shell) aws ssm start-session --target "$INSTANCE_ID" ;;
