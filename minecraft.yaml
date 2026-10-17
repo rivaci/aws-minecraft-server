@@ -1,16 +1,19 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >-
-  Petit serveur Minecraft Java (vanilla) sur EC2 Graviton, dans son propre VPC.
-  Le monde est stocke sur un volume EBS dedie, sauvegarde chaque jour par snapshot.
+  Serveur Minecraft Java sur EC2 Graviton dans son propre VPC, administre avec Crafty Controller,
+  avec une page web de demarrage/arret. Le monde est stocke sur un volume EBS dedie,
+  sauvegarde chaque jour par snapshot.
 
 Metadata:
   AWS::CloudFormation::Interface:
     ParameterGroups:
       - Label: { default: Licence }
         Parameters: [AcceptMinecraftEula]
+      - Label: { default: Acces }
+        Parameters: [ControlPassword, AllowedCidr]
       - Label: { default: Infrastructure }
-        Parameters: [InstanceType, DataVolumeSize, BackupRetentionDays, AllowedCidr, VpcCidr, AmiId]
-      - Label: { default: Jeu }
+        Parameters: [InstanceType, DataVolumeSize, BackupRetentionDays, VpcCidr, AmiId, CraftyVersion]
+      - Label: { default: Premier monde (cree a la premiere installation uniquement) }
         Parameters: [MinecraftVersion, ServerMotd, GameMode, Difficulty, MaxPlayers]
 
 Parameters:
@@ -18,6 +21,18 @@ Parameters:
     Type: String
     AllowedValues: ["true"]
     Description: Mettre "true" pour accepter le CLUF Minecraft (https://aka.ms/MinecraftEULA).
+
+  ControlPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    Description: Mot de passe de la page web de demarrage/arret du serveur (8 caracteres minimum).
+
+  AllowedCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    AllowedPattern: "^(\\d{1,3}\\.){3}\\d{1,3}/\\d{1,2}$"
+    Description: Plage IP autorisee a se connecter aux ports Minecraft (25565-25570/tcp).
 
   InstanceType:
     Type: String
@@ -31,20 +46,14 @@ Parameters:
     Default: 10
     MinValue: 4
     MaxValue: 500
-    Description: Taille (Go) du volume EBS qui contient le monde.
+    Description: Taille (Go) du volume EBS qui contient les mondes et les sauvegardes Crafty.
 
   BackupRetentionDays:
     Type: Number
     Default: 7
     MinValue: 1
     MaxValue: 365
-    Description: Nombre de snapshots quotidiens du monde a conserver.
-
-  AllowedCidr:
-    Type: String
-    Default: 0.0.0.0/0
-    AllowedPattern: "^(\\d{1,3}\\.){3}\\d{1,3}/\\d{1,2}$"
-    Description: Plage IP autorisee a se connecter au port Minecraft (25565/tcp).
+    Description: Nombre de snapshots quotidiens du volume a conserver.
 
   VpcCidr:
     Type: String
@@ -57,17 +66,23 @@ Parameters:
     Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
     Description: AMI Amazon Linux 2023 arm64 (resolue via SSM, ne pas modifier sauf besoin).
 
+  CraftyVersion:
+    Type: String
+    Default: 4.11.0
+    AllowedPattern: "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    Description: Version de Crafty Controller (image registry.gitlab.com/crafty-controller/crafty-4).
+
   MinecraftVersion:
     Type: String
     Default: latest
     AllowedPattern: "^[A-Za-z0-9._-]+$"
-    Description: Version Minecraft a installer ("latest" = derniere release stable).
+    Description: Version Minecraft du premier monde ("latest" = derniere release stable).
 
   ServerMotd:
     Type: String
     Default: Serveur Minecraft sur AWS
     AllowedPattern: "^[^\\r\\n]{1,59}$"
-    Description: Message affiche dans la liste des serveurs (applique a la premiere installation).
+    Description: Message affiche dans la liste des serveurs.
 
   GameMode:
     Type: String
@@ -139,6 +154,7 @@ Resources:
       SubnetId: !Ref PublicSubnet
       RouteTableId: !Ref PublicRouteTable
 
+  # Le panneau Crafty (8443) n'est pas ouvert : on y accede par un tunnel SSM.
   ServerSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
@@ -147,9 +163,9 @@ Resources:
       SecurityGroupIngress:
         - IpProtocol: tcp
           FromPort: 25565
-          ToPort: 25565
+          ToPort: 25570
           CidrIp: !Ref AllowedCidr
-          Description: Minecraft Java
+          Description: Minecraft Java (un port par monde lance en parallele)
       Tags:
         - { Key: Name, Value: !Sub "${AWS::StackName}-sg" }
 
@@ -167,7 +183,7 @@ Resources:
       AllocationId: !GetAtt ElasticIp.AllocationId
       InstanceId: !Ref Instance
 
-  # ---------------------------------------------------------------- Stockage du monde
+  # ---------------------------------------------------------------- Stockage des mondes
   # Volume independant de l'instance : il survit a un remplacement de l'instance
   # (nouvelle AMI, etc.) et un snapshot final est pris si la stack est supprimee.
   DataVolume:
@@ -247,6 +263,8 @@ Resources:
     Properties:
       Roles: [!Ref InstanceRole]
 
+  # L'installation n'est pas dans le UserData mais dans SetupDocument, applique par
+  # SSM a la creation et a chaque mise a jour de la stack (voir SetupAssociation).
   Instance:
     Type: AWS::EC2::Instance
     DependsOn: DefaultRoute
@@ -265,150 +283,410 @@ Resources:
             DeleteOnTermination: true
       Tags:
         - { Key: Name, Value: !Sub "${AWS::StackName}-server" }
-      # Le volume du monde est attache par l'instance elle-meme (et non par un
-      # AWS::EC2::VolumeAttachment) : lors d'un remplacement d'instance, la nouvelle
-      # attend que l'ancienne soit terminee pour recuperer le volume.
-      UserData:
-        Fn::Base64: !Sub
-          - |
-            #!/bin/bash
-            set -euxo pipefail
-            export AWS_DEFAULT_REGION=${AWS::Region}
 
-            imds() {
-              local token
-              token=$(curl -fsS -X PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 60')
-              curl -fsS -H "X-aws-ec2-metadata-token: $token" "http://169.254.169.254/latest/meta-data/$1"
-            }
-            INSTANCE_ID=$(imds instance-id)
+  # Script d'installation idempotent : volume des mondes, Docker, Crafty Controller,
+  # et creation du premier monde (ou reprise du serveur installe avant Crafty).
+  # Le volume est attache par l'instance elle-meme (et non par un AWS::EC2::VolumeAttachment) :
+  # lors d'un remplacement d'instance, la nouvelle attend que l'ancienne soit terminee.
+  SetupDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Command
+      Content:
+        schemaVersion: "2.2"
+        description: Installe ou met a jour Crafty Controller et le serveur Minecraft
+        mainSteps:
+          - action: aws:runShellScript
+            name: setup
+            inputs:
+              timeoutSeconds: "3600"
+              runCommand:
+                - !Sub
+                  - |
+                    cat > /usr/local/sbin/minecraft-setup <<'SETUP_EOF'
+                    #!/bin/bash
+                    # Genere par CloudFormation (stack ${AWS::StackName}). Relancable : sudo minecraft-setup
+                    set -euo pipefail
+                    exec > >(tee -a /var/log/minecraft-setup.log) 2>&1
+                    log() { echo "[setup $(date '+%F %T')] $*"; }
+                    export AWS_DEFAULT_REGION=${AWS::Region}
+                    DATA=/opt/minecraft
+                    CRAFTY=$DATA/crafty
+                    IMAGE=registry.gitlab.com/crafty-controller/crafty-4:${CraftyVersion}
+                    API=https://127.0.0.1:8443/api/v2
 
-            # Attendre l'association de l'Elastic IP (elle remplace l'IP publique et coupe les connexions en cours)
-            for _ in $(seq 1 60); do
-              [ "$(imds public-ipv4 || true)" = "${ElasticIp}" ] && break
-              sleep 5
-            done
+                    imds() {
+                      local token
+                      token=$(curl -fsS -X PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 60')
+                      curl -fsS -H "X-aws-ec2-metadata-token: $token" "http://169.254.169.254/latest/meta-data/$1"
+                    }
+                    INSTANCE_ID=$(imds instance-id)
 
-            dnf install -y --setopt=retries=10 jq
+                    log "Attente de l'Elastic IP"
+                    for _ in $(seq 1 60); do
+                      [ "$(imds public-ipv4 || true)" = "${ElasticIp}" ] && break
+                      sleep 5
+                    done
 
-            # ---- Volume du monde
-            VOLUME_ID=${DataVolume}
-            while true; do
-              ATTACHED_TO=$(aws ec2 describe-volumes --volume-ids "$VOLUME_ID" --query 'Volumes[0].Attachments[0].InstanceId' --output text || true)
-              [ "$ATTACHED_TO" = "$INSTANCE_ID" ] && break
-              STATE=$(aws ec2 describe-volumes --volume-ids "$VOLUME_ID" --query 'Volumes[0].State' --output text || true)
-              if [ "$STATE" = "available" ]; then
-                aws ec2 attach-volume --volume-id "$VOLUME_ID" --instance-id "$INSTANCE_ID" --device /dev/sdf || true
-              fi
-              sleep 10
-            done
-            DEVICE=/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_${VolumeIdNoDash}
-            for _ in $(seq 1 60); do [ -b "$DEVICE" ] && break; sleep 2; done
-            blkid "$DEVICE" || mkfs.xfs -L minecraft "$DEVICE"
-            DATA_UUID=$(blkid -s UUID -o value "$DEVICE")
-            mkdir -p /opt/minecraft
-            echo "UUID=$DATA_UUID /opt/minecraft xfs defaults,nofail 0 2" >> /etc/fstab
-            systemctl daemon-reload
-            mount /opt/minecraft
-            id minecraft || useradd --system --home-dir /opt/minecraft --shell /sbin/nologin minecraft
+                    dnf install -y --setopt=retries=10 jq docker
+                    systemctl enable --now docker
 
-            # ---- Serveur Minecraft + Java (version demandee par Mojang)
-            MANIFEST_URL=https://piston-meta.mojang.com/mc/game/version_manifest_v2.json
-            MANIFEST=$(curl -fsSL --retry 10 --retry-all-errors "$MANIFEST_URL")
-            MC_VERSION="${MinecraftVersion}"
-            [ "$MC_VERSION" = "latest" ] && MC_VERSION=$(echo "$MANIFEST" | jq -r .latest.release)
-            VERSION_URL=$(echo "$MANIFEST" | jq -er --arg v "$MC_VERSION" '.versions[] | select(.id == $v) | .url')
-            VERSION_JSON=$(curl -fsSL --retry 10 --retry-all-errors "$VERSION_URL")
-            JAVA_MAJOR=$(echo "$VERSION_JSON" | jq -r '.javaVersion.majorVersion // 21')
+                    # ---- Volume des mondes
+                    if ! mountpoint -q $DATA; then
+                      log "Attachement du volume ${DataVolume}"
+                      while true; do
+                        ATTACHED_TO=$(aws ec2 describe-volumes --volume-ids ${DataVolume} --query 'Volumes[0].Attachments[0].InstanceId' --output text || true)
+                        [ "$ATTACHED_TO" = "$INSTANCE_ID" ] && break
+                        STATE=$(aws ec2 describe-volumes --volume-ids ${DataVolume} --query 'Volumes[0].State' --output text || true)
+                        if [ "$STATE" = "available" ]; then
+                          aws ec2 attach-volume --volume-id ${DataVolume} --instance-id "$INSTANCE_ID" --device /dev/sdf || true
+                        fi
+                        sleep 10
+                      done
+                      DEVICE=/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_${VolumeIdNoDash}
+                      for _ in $(seq 1 60); do [ -b "$DEVICE" ] && break; sleep 2; done
+                      blkid "$DEVICE" || mkfs.xfs -L minecraft "$DEVICE"
+                      DATA_UUID=$(blkid -s UUID -o value "$DEVICE")
+                      mkdir -p $DATA
+                      grep -q "$DATA_UUID" /etc/fstab || echo "UUID=$DATA_UUID $DATA xfs defaults,nofail 0 2" >> /etc/fstab
+                      systemctl daemon-reload
+                      mount $DATA
+                    fi
+                    xfs_growfs $DATA >/dev/null || true  # suit une augmentation de DataVolumeSize
 
-            if ! dnf install -y --setopt=retries=10 "java-$JAVA_MAJOR-amazon-corretto-headless"; then
-              # Version de Java pas (encore) dans les depots AL2023 : archive officielle Corretto
-              mkdir -p /opt/java
-              curl -fsSL --retry 10 --retry-all-errors "https://corretto.aws/downloads/latest/amazon-corretto-$JAVA_MAJOR-aarch64-linux-jdk.tar.gz" \
-                | tar -xz -C /opt/java --strip-components=1
-              ln -sf /opt/java/bin/java /usr/bin/java
-            fi
+                    # ---- Ancien service Minecraft (installation sans Crafty)
+                    if [ -f /etc/systemd/system/minecraft.service ]; then
+                      log "Arret de l'ancien service minecraft"
+                      systemctl disable --now minecraft.service minecraft.socket || true
+                      rm -f /etc/systemd/system/minecraft.service /etc/systemd/system/minecraft.socket \
+                        /usr/local/bin/mc-cmd /usr/local/bin/minecraft-start
+                      systemctl daemon-reload
+                    fi
 
-            curl -fsSL --retry 10 --retry-all-errors -o /opt/minecraft/server.jar "$(echo "$VERSION_JSON" | jq -r .downloads.server.url)"
-            echo "$(echo "$VERSION_JSON" | jq -r .downloads.server.sha1)  /opt/minecraft/server.jar" | sha1sum -c -
+                    # ---- Crafty Controller (conteneur Docker sur le reseau de l'hote)
+                    mkdir -p $CRAFTY/backups $CRAFTY/logs $CRAFTY/servers $CRAFTY/config $CRAFTY/import/upload
+                    chmod 2775 $CRAFTY/import $CRAFTY/import/upload
+                    for _ in $(seq 1 5); do docker pull -q "$IMAGE" && break; sleep 15; done
+                    cat > /run/crafty.service <<'EOF'
+                    [Unit]
+                    Description=Crafty Controller (administration Minecraft)
+                    Requires=docker.service
+                    After=docker.service network-online.target
+                    Wants=network-online.target
+                    RequiresMountsFor=/opt/minecraft
 
-            echo "eula=${AcceptMinecraftEula}" > /opt/minecraft/eula.txt
-            if [ ! -f /opt/minecraft/server.properties ]; then
-              cat > /opt/minecraft/server.properties <<'EOF'
-            motd=${ServerMotd}
-            gamemode=${GameMode}
-            difficulty=${Difficulty}
-            max-players=${MaxPlayers}
-            EOF
-            fi
-            chown -R minecraft:minecraft /opt/minecraft
+                    [Service]
+                    ExecStartPre=-/usr/bin/docker rm -f crafty
+                    ExecStart=/usr/bin/docker run --rm --name crafty --network host -e TZ=Europe/Paris \
+                      -v /opt/minecraft/crafty/backups:/crafty/backups \
+                      -v /opt/minecraft/crafty/logs:/crafty/logs \
+                      -v /opt/minecraft/crafty/servers:/crafty/servers \
+                      -v /opt/minecraft/crafty/config:/crafty/app/config \
+                      -v /opt/minecraft/crafty/import:/crafty/import \
+                      registry.gitlab.com/crafty-controller/crafty-4:${CraftyVersion}
+                    # Crafty arrete proprement les serveurs (sauvegarde des mondes) avant de quitter
+                    ExecStop=/usr/bin/docker stop -t 170 crafty
+                    TimeoutStopSec=180
+                    Restart=always
+                    RestartSec=10
 
-            # ---- Services systemd
-            cat > /usr/local/bin/minecraft-start <<'EOF'
-            #!/bin/bash
-            # Heap Java = 75 % de la RAM (recalcule a chaque demarrage, suit un changement de type d'instance)
-            HEAP_MB=$(awk '/MemTotal/ { print int($2 / 1024 * 0.75) }' /proc/meminfo)
-            exec /usr/bin/java -Xms"$HEAP_MB"M -Xmx"$HEAP_MB"M -jar /opt/minecraft/server.jar nogui
-            EOF
+                    [Install]
+                    WantedBy=multi-user.target
+                    EOF
+                    systemctl enable docker
+                    if ! cmp -s /run/crafty.service /etc/systemd/system/crafty.service; then
+                      log "(Re)demarrage de Crafty $IMAGE"
+                      mv /run/crafty.service /etc/systemd/system/crafty.service
+                      systemctl daemon-reload
+                      systemctl enable crafty
+                      systemctl restart crafty
+                    else
+                      rm -f /run/crafty.service
+                      systemctl enable --now crafty
+                    fi
 
-            cat > /usr/local/bin/mc-cmd <<'EOF'
-            #!/bin/bash
-            # Envoie une commande a la console du serveur. Ex : sudo mc-cmd op MonPseudo
-            [ $# -gt 0 ] || { echo "usage : sudo mc-cmd <commande minecraft>" >&2; exit 1; }
-            [ -p /run/minecraft.stdin ] || { echo "le serveur n'est pas demarre" >&2; exit 1; }
-            echo "$*" > /run/minecraft.stdin
-            EOF
-            chmod 755 /usr/local/bin/minecraft-start /usr/local/bin/mc-cmd
+                    log "Attente de l'API Crafty"
+                    for _ in $(seq 1 120); do curl -fsk "$API" >/dev/null && break; sleep 5; done
+                    curl -fsk "$API" >/dev/null
 
-            cat > /etc/systemd/system/minecraft.socket <<'EOF'
-            [Unit]
-            Description=Console du serveur Minecraft
-            PartOf=minecraft.service
+                    cat > /usr/local/bin/crafty-password <<'EOF'
+                    #!/bin/bash
+                    # Identifiants crees par Crafty a la premiere installation (a changer apres la premiere connexion)
+                    jq -r '"Utilisateur : \(.username)\nMot de passe : \(.password)"' /opt/minecraft/crafty/config/default-creds.txt
+                    EOF
+                    chmod 700 /usr/local/bin/crafty-password
 
-            [Socket]
-            ListenFIFO=/run/minecraft.stdin
-            SocketMode=0600
-            RemoveOnStop=true
-            EOF
+                    # ---- Premier monde : reprise du serveur installe avant Crafty, ou nouveau monde
+                    if [ ! -f $CRAFTY/.premier-monde-cree ]; then
+                      TOKEN=$(jq -n --arg p "$(jq -r .password $CRAFTY/config/default-creds.txt)" '{username: "admin", password: $p}' \
+                        | curl -fsSk -X POST "$API/auth/login" -H 'Content-Type: application/json' --data @- | jq -er .data.token)
+                      api() {
+                        local method=$1 path=$2
+                        shift 2
+                        curl -fsSk -X "$method" "$API$path" -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' "$@"
+                      }
+                      SERVER_ID=$(api GET /servers | jq -r '.data[] | select(.server_name == "Monde principal") | .server_id' | head -n1)
 
-            cat > /etc/systemd/system/minecraft.service <<'EOF'
-            [Unit]
-            Description=Serveur Minecraft
-            Wants=network-online.target
-            After=network-online.target minecraft.socket
-            Requires=minecraft.socket
-            RequiresMountsFor=/opt/minecraft
+                      if [ -z "$SERVER_ID" ]; then
+                        if [ -f $DATA/server.jar ] || [ -d $DATA/serveur-avant-crafty ]; then
+                          log "Reprise du serveur existant (copie conservee dans $DATA/serveur-avant-crafty)"
+                          SEED=$DATA/serveur-avant-crafty
+                          mkdir -p $SEED
+                          find $DATA -mindepth 1 -maxdepth 1 ! -name crafty ! -name serveur-avant-crafty ! -name nouveau-monde -exec mv -t $SEED {} +
+                        else
+                          log "Telechargement de Minecraft ${MinecraftVersion}"
+                          SEED=$DATA/nouveau-monde
+                          rm -rf $SEED
+                          mkdir -p $SEED
+                          MANIFEST=$(curl -fsSL --retry 10 --retry-all-errors https://piston-meta.mojang.com/mc/game/version_manifest_v2.json)
+                          MC_VERSION="${MinecraftVersion}"
+                          [ "$MC_VERSION" = "latest" ] && MC_VERSION=$(echo "$MANIFEST" | jq -r .latest.release)
+                          VERSION_URL=$(echo "$MANIFEST" | jq -er --arg v "$MC_VERSION" '.versions[] | select(.id == $v) | .url')
+                          VERSION_JSON=$(curl -fsSL --retry 10 --retry-all-errors "$VERSION_URL")
+                          curl -fsSL --retry 10 --retry-all-errors -o $SEED/server.jar "$(echo "$VERSION_JSON" | jq -r .downloads.server.url)"
+                          echo "$(echo "$VERSION_JSON" | jq -r .downloads.server.sha1)  $SEED/server.jar" | sha1sum -c -
+                          echo "eula=${AcceptMinecraftEula}" > $SEED/eula.txt
+                          cat > $SEED/server.properties <<'EOF'
+                    motd=${ServerMotd}
+                    gamemode=${GameMode}
+                    difficulty=${Difficulty}
+                    max-players=${MaxPlayers}
+                    EOF
+                        fi
 
-            [Service]
-            User=minecraft
-            WorkingDirectory=/opt/minecraft
-            Sockets=minecraft.socket
-            StandardInput=socket
-            StandardOutput=journal
-            StandardError=journal
-            ExecStart=/usr/local/bin/minecraft-start
-            # SIGTERM : la JVM sauvegarde le monde avant de s'arreter
-            SuccessExitStatus=0 143
-            TimeoutStopSec=120
-            Restart=on-failure
-            RestartSec=10
+                        log "Import du monde dans Crafty"
+                        python3 -c 'import shutil, sys; shutil.make_archive(sys.argv[1], "zip", sys.argv[2])' \
+                          $CRAFTY/import/upload/premier-monde $SEED
+                        chmod 664 $CRAFTY/import/upload/premier-monde.zip
+                        MEM_MB=$(awk '/MemTotal/ { print int($2 / 1024 * 0.6) }' /proc/meminfo)
+                        BODY=$(jq -n --argjson mem "$(awk -v m="$MEM_MB" 'BEGIN { printf "%.2f", m / 1024 }')" '{
+                          name: "Monde principal",
+                          monitoring_type: "minecraft_java",
+                          minecraft_java_monitoring_data: {host: "127.0.0.1", port: 25565},
+                          create_type: "minecraft_java",
+                          minecraft_java_create_data: {create_type: "import_server", import_server_create_data: {
+                            archive_name: "premier-monde.zip", archive_internal_path: "", jarfile: "server.jar",
+                            mem_min: $mem, mem_max: $mem, server_properties_port: 25565, agree_to_eula: true}}}')
+                        SERVER_ID=$(api POST /servers --data "$BODY" | jq -er .data.new_server_id)
+                        for _ in $(seq 1 120); do
+                          if [ ! -f $CRAFTY/import/upload/premier-monde.zip ] \
+                            && [ "$(api GET /servers/"$SERVER_ID"/stats | jq -r .data.importing)" = "false" ]; then
+                            break
+                          fi
+                          sleep 5
+                        done
 
-            [Install]
-            WantedBy=multi-user.target
-            EOF
+                        # Java demande par cette version de Minecraft (version.json du jar), parmi ceux de l'image Crafty
+                        JAVA_MAJOR=$(python3 - $SEED/server.jar <<'EOF'
+                    import json, sys, zipfile
+                    try:
+                        print(json.load(zipfile.ZipFile(sys.argv[1]).open("version.json")).get("java_version", 8))
+                    except Exception:
+                        print(8)
+                    EOF
+                    )
+                        JAVA_BIN=java
+                        for candidate in $(docker exec crafty update-alternatives --list java | sort -V); do
+                          if [ "$(echo "$candidate" | sed -E 's#.*/java-([0-9]+)-.*#\1#')" -ge "$JAVA_MAJOR" ] 2>/dev/null; then
+                            JAVA_BIN=$candidate
+                            break
+                          fi
+                        done
+                        log "Java $JAVA_MAJOR requis : $JAVA_BIN, $MEM_MB Mo de memoire"
+                        api PATCH /servers/"$SERVER_ID" --data "$(jq -n --arg java "$JAVA_BIN" --arg mem "$MEM_MB" '{
+                          execution_command: ("\"" + $java + "\" -Xms" + $mem + "M -Xmx" + $mem + "M -jar server.jar nogui"),
+                          auto_start: true, crash_detection: true}')"
+                        if [ "$SEED" = "$DATA/nouveau-monde" ]; then rm -rf $SEED; fi
+                      fi
 
-            systemctl daemon-reload
-            systemctl enable --now minecraft.service
-          - VolumeIdNoDash: !Join ["", !Split ["-", !Ref DataVolume]]
+                      api POST /servers/"$SERVER_ID"/action/start_server || true
+                      echo "$SERVER_ID" > $CRAFTY/.premier-monde-cree
+                    fi
+
+                    docker image prune -f >/dev/null
+                    log "Installation terminee"
+                    SETUP_EOF
+                    chmod 700 /usr/local/sbin/minecraft-setup
+                    /usr/local/sbin/minecraft-setup
+                  - VolumeIdNoDash: !Join ["", !Split ["-", !Ref DataVolume]]
+
+  # Applique SetupDocument a la creation et a chaque mise a jour (nouveau document ou nouvelle instance).
+  SetupAssociation:
+    Type: AWS::SSM::Association
+    Properties:
+      Name: !Ref SetupDocument
+      Targets:
+        - Key: InstanceIds
+          Values: [!Ref Instance]
+
+  # ---------------------------------------------------------------- Page de demarrage/arret
+  ControlLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 14
+
+  ControlRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: control-instance
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt ControlLogGroup.Arn
+              - Effect: Allow
+                Action: ec2:DescribeInstances
+                Resource: "*"
+              - Effect: Allow
+                Action: [ec2:StartInstances, ec2:StopInstances]
+                Resource: !Sub arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/${Instance}
+              # Demarrer une instance dont les volumes sont chiffres
+              - Effect: Allow
+                Action: kms:CreateGrant
+                Resource: "*"
+                Condition:
+                  Bool: { kms:GrantIsForAWSResource: true }
+
+  ControlFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Page web de demarrage/arret du serveur Minecraft
+      Runtime: python3.13
+      Architectures: [arm64]
+      Handler: index.handler
+      Timeout: 10
+      MemorySize: 128
+      Role: !GetAtt ControlRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref ControlLogGroup
+      Environment:
+        Variables:
+          INSTANCE_ID: !Ref Instance
+          SERVER_IP: !Ref ElasticIp
+          PASSWORD: !Ref ControlPassword
+      Code:
+        ZipFile: |
+          import hmac, json, os, socket
+          import boto3
+          from botocore.exceptions import ClientError
+
+          ec2 = boto3.client("ec2")
+          ID, IP = os.environ["INSTANCE_ID"], os.environ["SERVER_IP"]
+          PASSWORD = os.environ["PASSWORD"].encode()
+
+          def varint(n):
+              out = b""
+              while True:
+                  b, n = n & 127, n >> 7
+                  out += bytes([b | (128 if n else 0)])
+                  if not n:
+                      return out
+
+          def players():  # Server List Ping Minecraft
+              try:
+                  with socket.create_connection((IP, 25565), timeout=2) as s:
+                      hello = b"\0" + varint(767) + varint(len(IP)) + IP.encode() + (25565).to_bytes(2, "big") + b"\1"
+                      s.sendall(varint(len(hello)) + hello + b"\1\0")
+                      f = s.makefile("rb")
+
+                      def read_varint():
+                          n = 0
+                          for i in range(5):
+                              b = f.read(1)[0]
+                              n |= (b & 127) << 7 * i
+                              if b < 128:
+                                  return n
+
+                      read_varint(), read_varint()
+                      p = json.loads(f.read(read_varint()))["players"]
+                      return {"online": p["online"], "max": p["max"]}
+              except Exception:
+                  return None
+
+          def status():
+              state = ec2.describe_instances(InstanceIds=[ID])["Reservations"][0]["Instances"][0]["State"]["Name"]
+              return {"state": state, "ip": IP, "players": players() if state == "running" else None}
+
+          def reply(code, data, kind="application/json"):
+              return {"statusCode": code, "headers": {"Content-Type": kind}, "body": data if kind == "text/html" else json.dumps(data)}
+
+          def handler(event, _context):
+              method, path = event["requestContext"]["http"]["method"], event.get("rawPath", "/")
+              if method == "GET":
+                  return reply(200, status()) if path == "/status" else reply(200, PAGE, "text/html")
+              try:  # le corps est envoye en text/plain par la page, donc jamais encode en base64
+                  password = str(json.loads(event["body"])["password"]).encode()
+              except Exception:
+                  password = b""
+              if not hmac.compare_digest(password, PASSWORD):
+                  return reply(403, {"error": "Mot de passe incorrect"})
+              try:
+                  if path == "/start":
+                      ec2.start_instances(InstanceIds=[ID])
+                  elif path == "/stop":
+                      ec2.stop_instances(InstanceIds=[ID])
+              except ClientError as e:
+                  return reply(409, {"error": e.response["Error"]["Message"]})
+              return reply(200, status())
+
+          PAGE = """<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+          <title>Serveur Minecraft</title><style>:root{color-scheme:light dark}
+          body{font:16px/1.5 system-ui,sans-serif;max-width:360px;margin:48px auto;padding:0 16px}
+          input,button{font:inherit;width:100%;box-sizing:border-box;padding:10px;margin-top:10px}</style><h1>Serveur Minecraft</h1><p><b id=st>...</b></p><p>Adresse : <b id=ip></b></p><p id=pl></p>
+          <input type=password id=pw placeholder="Mot de passe"><button id=start disabled>Démarrer</button>
+          <button id=stop disabled>Arrêter</button><p id=msg></p><script>
+          const T={pending:"🟠 Démarrage…",running:"🟢 Allumé",stopping:"🟠 Arrêt…",stopped:"⚪ Éteint"},$=id=>document.getElementById(id);let cur={};
+          function show(s){cur=s;$("st").textContent=T[s.state]||s.state;$("ip").textContent=s.ip;
+          $("pl").textContent=s.state!="running"?"":s.players?s.players.online+" / "+s.players.max+" joueurs connectés":"Minecraft démarre…";
+          $("start").disabled=s.state!="stopped";$("stop").disabled=s.state!="running"}
+          async function refresh(){try{show(await(await fetch("status")).json())}catch(e){}}
+          async function act(a){const n=cur.players?cur.players.online:0;if(a=="stop"&&n&&!confirm(n+" joueur(s) en ligne. Arrêter quand même ?"))return;
+          const r=await fetch(a,{method:"POST",body:JSON.stringify({password:$("pw").value})}),d=await r.json();$("msg").textContent=r.ok?"":d.error;if(r.ok)show(d)}
+          $("start").onclick=()=>act("start");$("stop").onclick=()=>act("stop");refresh();setInterval(refresh,5000)
+          </script>"""
+
+  ControlUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !GetAtt ControlFunction.Arn
+      AuthType: NONE
+
+  ControlUrlPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ControlFunction
+      Action: lambda:InvokeFunctionUrl
+      Principal: "*"
+      FunctionUrlAuthType: NONE
+
+  ControlInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ControlFunction
+      Action: lambda:InvokeFunction
+      Principal: "*"
+      InvokedViaFunctionUrl: true
 
 Outputs:
   ServerAddress:
     Description: Adresse a saisir dans Minecraft (Multijoueur > Ajouter un serveur)
     Value: !Ref ElasticIp
+  ControlPageUrl:
+    Description: Page web de demarrage/arret du serveur
+    Value: !GetAtt ControlUrl.FunctionUrl
   InstanceId:
     Value: !Ref Instance
-  SsmSessionCommand:
-    Description: Ouvrir un shell sur le serveur (necessite le plugin Session Manager)
-    Value: !Sub aws ssm start-session --target ${Instance} --region ${AWS::Region} --profile default
+  SetupAssociationId:
+    Description: Association SSM qui installe/met a jour le serveur
+    Value: !GetAtt SetupAssociation.AssociationId
   DataVolumeId:
-    Description: Volume EBS contenant le monde
+    Description: Volume EBS contenant les mondes
     Value: !Ref DataVolume
