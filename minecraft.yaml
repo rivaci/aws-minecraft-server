@@ -1,0 +1,414 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Petit serveur Minecraft Java (vanilla) sur EC2 Graviton, dans son propre VPC.
+  Le monde est stocke sur un volume EBS dedie, sauvegarde chaque jour par snapshot.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Licence }
+        Parameters: [AcceptMinecraftEula]
+      - Label: { default: Infrastructure }
+        Parameters: [InstanceType, DataVolumeSize, BackupRetentionDays, AllowedCidr, VpcCidr, AmiId]
+      - Label: { default: Jeu }
+        Parameters: [MinecraftVersion, ServerMotd, GameMode, Difficulty, MaxPlayers]
+
+Parameters:
+  AcceptMinecraftEula:
+    Type: String
+    AllowedValues: ["true"]
+    Description: Mettre "true" pour accepter le CLUF Minecraft (https://aka.ms/MinecraftEULA).
+
+  InstanceType:
+    Type: String
+    Default: t4g.medium
+    AllowedPattern: "^[a-z][a-z0-9]*g[a-z]*\\.[a-z0-9]+$"
+    ConstraintDescription: Doit etre un type d'instance Graviton (arm64), ex. t4g.medium.
+    Description: Type d'instance Graviton (arm64). t4g.medium = 2 vCPU / 4 Go, suffisant pour une dizaine de joueurs.
+
+  DataVolumeSize:
+    Type: Number
+    Default: 10
+    MinValue: 4
+    MaxValue: 500
+    Description: Taille (Go) du volume EBS qui contient le monde.
+
+  BackupRetentionDays:
+    Type: Number
+    Default: 7
+    MinValue: 1
+    MaxValue: 365
+    Description: Nombre de snapshots quotidiens du monde a conserver.
+
+  AllowedCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    AllowedPattern: "^(\\d{1,3}\\.){3}\\d{1,3}/\\d{1,2}$"
+    Description: Plage IP autorisee a se connecter au port Minecraft (25565/tcp).
+
+  VpcCidr:
+    Type: String
+    Default: 10.42.0.0/16
+    AllowedPattern: "^(\\d{1,3}\\.){3}\\d{1,3}/16$"
+    Description: Plage IP du VPC (/16).
+
+  AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+    Description: AMI Amazon Linux 2023 arm64 (resolue via SSM, ne pas modifier sauf besoin).
+
+  MinecraftVersion:
+    Type: String
+    Default: latest
+    AllowedPattern: "^[A-Za-z0-9._-]+$"
+    Description: Version Minecraft a installer ("latest" = derniere release stable).
+
+  ServerMotd:
+    Type: String
+    Default: Serveur Minecraft sur AWS
+    AllowedPattern: "^[^\\r\\n]{1,59}$"
+    Description: Message affiche dans la liste des serveurs (applique a la premiere installation).
+
+  GameMode:
+    Type: String
+    Default: survival
+    AllowedValues: [survival, creative, adventure, spectator]
+
+  Difficulty:
+    Type: String
+    Default: normal
+    AllowedValues: [peaceful, easy, normal, hard]
+
+  MaxPlayers:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    MaxValue: 100
+
+Resources:
+  # ---------------------------------------------------------------- Reseau
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-vpc" }
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-igw" }
+
+  VpcGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidr, 1, 8]]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-public" }
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-public" }
+
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  ServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Minecraft (pas de SSH, administration via SSM Session Manager)
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 25565
+          ToPort: 25565
+          CidrIp: !Ref AllowedCidr
+          Description: Minecraft Java
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-sg" }
+
+  ElasticIp:
+    Type: AWS::EC2::EIP
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-ip" }
+
+  ElasticIpAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt ElasticIp.AllocationId
+      InstanceId: !Ref Instance
+
+  # ---------------------------------------------------------------- Stockage du monde
+  # Volume independant de l'instance : il survit a un remplacement de l'instance
+  # (nouvelle AMI, etc.) et un snapshot final est pris si la stack est supprimee.
+  DataVolume:
+    Type: AWS::EC2::Volume
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      AvailabilityZone: !GetAtt PublicSubnet.AvailabilityZone
+      Size: !Ref DataVolumeSize
+      VolumeType: gp3
+      Encrypted: true
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-world" }
+        - { Key: MinecraftBackup, Value: !Ref AWS::StackName }
+
+  BackupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: dlm.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSDataLifecycleManagerServiceRole
+
+  BackupPolicy:
+    Type: AWS::DLM::LifecyclePolicy
+    Properties:
+      Description: !Sub Snapshots quotidiens du monde Minecraft - ${AWS::StackName}
+      State: ENABLED
+      ExecutionRoleArn: !GetAtt BackupRole.Arn
+      PolicyDetails:
+        PolicyType: EBS_SNAPSHOT_MANAGEMENT
+        ResourceTypes: [VOLUME]
+        TargetTags:
+          - { Key: MinecraftBackup, Value: !Ref AWS::StackName }
+        Schedules:
+          - Name: daily
+            CopyTags: true
+            CreateRule:
+              Interval: 24
+              IntervalUnit: HOURS
+              Times: ["04:00"]
+            RetainRule:
+              Count: !Ref BackupRetentionDays
+
+  # ---------------------------------------------------------------- Instance
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: attach-world-volume
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ec2:AttachVolume
+                Resource:
+                  - !Sub arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:volume/${DataVolume}
+                  - !Sub arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*
+              - Effect: Allow
+                Action: ec2:DescribeVolumes
+                Resource: "*"
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref InstanceRole]
+
+  Instance:
+    Type: AWS::EC2::Instance
+    DependsOn: DefaultRoute
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref InstanceProfile
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds: [!Ref ServerSecurityGroup]
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 8
+            VolumeType: gp3
+            Encrypted: true
+            DeleteOnTermination: true
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-server" }
+      # Le volume du monde est attache par l'instance elle-meme (et non par un
+      # AWS::EC2::VolumeAttachment) : lors d'un remplacement d'instance, la nouvelle
+      # attend que l'ancienne soit terminee pour recuperer le volume.
+      UserData:
+        Fn::Base64: !Sub
+          - |
+            #!/bin/bash
+            set -euxo pipefail
+            export AWS_DEFAULT_REGION=${AWS::Region}
+
+            imds() {
+              local token
+              token=$(curl -fsS -X PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 60')
+              curl -fsS -H "X-aws-ec2-metadata-token: $token" "http://169.254.169.254/latest/meta-data/$1"
+            }
+            INSTANCE_ID=$(imds instance-id)
+
+            # Attendre l'association de l'Elastic IP (elle remplace l'IP publique et coupe les connexions en cours)
+            for _ in $(seq 1 60); do
+              [ "$(imds public-ipv4 || true)" = "${ElasticIp}" ] && break
+              sleep 5
+            done
+
+            dnf install -y --setopt=retries=10 jq
+
+            # ---- Volume du monde
+            VOLUME_ID=${DataVolume}
+            while true; do
+              ATTACHED_TO=$(aws ec2 describe-volumes --volume-ids "$VOLUME_ID" --query 'Volumes[0].Attachments[0].InstanceId' --output text || true)
+              [ "$ATTACHED_TO" = "$INSTANCE_ID" ] && break
+              STATE=$(aws ec2 describe-volumes --volume-ids "$VOLUME_ID" --query 'Volumes[0].State' --output text || true)
+              if [ "$STATE" = "available" ]; then
+                aws ec2 attach-volume --volume-id "$VOLUME_ID" --instance-id "$INSTANCE_ID" --device /dev/sdf || true
+              fi
+              sleep 10
+            done
+            DEVICE=/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_${VolumeIdNoDash}
+            for _ in $(seq 1 60); do [ -b "$DEVICE" ] && break; sleep 2; done
+            blkid "$DEVICE" || mkfs.xfs -L minecraft "$DEVICE"
+            DATA_UUID=$(blkid -s UUID -o value "$DEVICE")
+            mkdir -p /opt/minecraft
+            echo "UUID=$DATA_UUID /opt/minecraft xfs defaults,nofail 0 2" >> /etc/fstab
+            systemctl daemon-reload
+            mount /opt/minecraft
+            id minecraft || useradd --system --home-dir /opt/minecraft --shell /sbin/nologin minecraft
+
+            # ---- Serveur Minecraft + Java (version demandee par Mojang)
+            MANIFEST_URL=https://piston-meta.mojang.com/mc/game/version_manifest_v2.json
+            MANIFEST=$(curl -fsSL --retry 10 --retry-all-errors "$MANIFEST_URL")
+            MC_VERSION="${MinecraftVersion}"
+            [ "$MC_VERSION" = "latest" ] && MC_VERSION=$(echo "$MANIFEST" | jq -r .latest.release)
+            VERSION_URL=$(echo "$MANIFEST" | jq -er --arg v "$MC_VERSION" '.versions[] | select(.id == $v) | .url')
+            VERSION_JSON=$(curl -fsSL --retry 10 --retry-all-errors "$VERSION_URL")
+            JAVA_MAJOR=$(echo "$VERSION_JSON" | jq -r '.javaVersion.majorVersion // 21')
+
+            if ! dnf install -y --setopt=retries=10 "java-$JAVA_MAJOR-amazon-corretto-headless"; then
+              # Version de Java pas (encore) dans les depots AL2023 : archive officielle Corretto
+              mkdir -p /opt/java
+              curl -fsSL --retry 10 --retry-all-errors "https://corretto.aws/downloads/latest/amazon-corretto-$JAVA_MAJOR-aarch64-linux-jdk.tar.gz" \
+                | tar -xz -C /opt/java --strip-components=1
+              ln -sf /opt/java/bin/java /usr/bin/java
+            fi
+
+            curl -fsSL --retry 10 --retry-all-errors -o /opt/minecraft/server.jar "$(echo "$VERSION_JSON" | jq -r .downloads.server.url)"
+            echo "$(echo "$VERSION_JSON" | jq -r .downloads.server.sha1)  /opt/minecraft/server.jar" | sha1sum -c -
+
+            echo "eula=${AcceptMinecraftEula}" > /opt/minecraft/eula.txt
+            if [ ! -f /opt/minecraft/server.properties ]; then
+              cat > /opt/minecraft/server.properties <<'EOF'
+            motd=${ServerMotd}
+            gamemode=${GameMode}
+            difficulty=${Difficulty}
+            max-players=${MaxPlayers}
+            EOF
+            fi
+            chown -R minecraft:minecraft /opt/minecraft
+
+            # ---- Services systemd
+            cat > /usr/local/bin/minecraft-start <<'EOF'
+            #!/bin/bash
+            # Heap Java = 75 % de la RAM (recalcule a chaque demarrage, suit un changement de type d'instance)
+            HEAP_MB=$(awk '/MemTotal/ { print int($2 / 1024 * 0.75) }' /proc/meminfo)
+            exec /usr/bin/java -Xms"$HEAP_MB"M -Xmx"$HEAP_MB"M -jar /opt/minecraft/server.jar nogui
+            EOF
+
+            cat > /usr/local/bin/mc-cmd <<'EOF'
+            #!/bin/bash
+            # Envoie une commande a la console du serveur. Ex : sudo mc-cmd op MonPseudo
+            [ $# -gt 0 ] || { echo "usage : sudo mc-cmd <commande minecraft>" >&2; exit 1; }
+            [ -p /run/minecraft.stdin ] || { echo "le serveur n'est pas demarre" >&2; exit 1; }
+            echo "$*" > /run/minecraft.stdin
+            EOF
+            chmod 755 /usr/local/bin/minecraft-start /usr/local/bin/mc-cmd
+
+            cat > /etc/systemd/system/minecraft.socket <<'EOF'
+            [Unit]
+            Description=Console du serveur Minecraft
+            PartOf=minecraft.service
+
+            [Socket]
+            ListenFIFO=/run/minecraft.stdin
+            SocketMode=0600
+            RemoveOnStop=true
+            EOF
+
+            cat > /etc/systemd/system/minecraft.service <<'EOF'
+            [Unit]
+            Description=Serveur Minecraft
+            Wants=network-online.target
+            After=network-online.target minecraft.socket
+            Requires=minecraft.socket
+            RequiresMountsFor=/opt/minecraft
+
+            [Service]
+            User=minecraft
+            WorkingDirectory=/opt/minecraft
+            Sockets=minecraft.socket
+            StandardInput=socket
+            StandardOutput=journal
+            StandardError=journal
+            ExecStart=/usr/local/bin/minecraft-start
+            # SIGTERM : la JVM sauvegarde le monde avant de s'arreter
+            SuccessExitStatus=0 143
+            TimeoutStopSec=120
+            Restart=on-failure
+            RestartSec=10
+
+            [Install]
+            WantedBy=multi-user.target
+            EOF
+
+            systemctl daemon-reload
+            systemctl enable --now minecraft.service
+          - VolumeIdNoDash: !Join ["", !Split ["-", !Ref DataVolume]]
+
+Outputs:
+  ServerAddress:
+    Description: Adresse a saisir dans Minecraft (Multijoueur > Ajouter un serveur)
+    Value: !Ref ElasticIp
+  InstanceId:
+    Value: !Ref Instance
+  SsmSessionCommand:
+    Description: Ouvrir un shell sur le serveur (necessite le plugin Session Manager)
+    Value: !Sub aws ssm start-session --target ${Instance} --region ${AWS::Region} --profile default
+  DataVolumeId:
+    Description: Volume EBS contenant le monde
+    Value: !Ref DataVolume
