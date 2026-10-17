@@ -15,19 +15,24 @@ LOCAL_PORT=${LOCAL_PORT:-8443}
 export AWS_PROFILE=${AWS_PROFILE:-default}
 export AWS_REGION=${AWS_REGION:-eu-west-3}
 
+# Sortie texte de l'AWS CLI, sans les retours chariot qu'ajoute la version Windows
+aws_text() {
+  aws "$@" --output text | tr -d '\r'
+}
+
 output() {
-  aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
-    --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text
+  aws_text cloudformation describe-stacks --stack-name "$STACK_NAME" \
+    --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue"
 }
 
 # Execute une commande sur le serveur via SSM et affiche sa sortie
 remote() {
   local command_id
-  command_id=$(aws ssm send-command --instance-ids "$INSTANCE_ID" --document-name AWS-RunShellScript \
-    --parameters "{\"commands\":[\"$1\"]}" --query Command.CommandId --output text)
+  command_id=$(aws_text ssm send-command --instance-ids "$INSTANCE_ID" --document-name AWS-RunShellScript \
+    --parameters "{\"commands\":[\"$1\"]}" --query Command.CommandId)
   aws ssm wait command-executed --command-id "$command_id" --instance-id "$INSTANCE_ID" || true
-  aws ssm get-command-invocation --command-id "$command_id" --instance-id "$INSTANCE_ID" \
-    --query StandardOutputContent --output text
+  aws_text ssm get-command-invocation --command-id "$command_id" --instance-id "$INSTANCE_ID" \
+    --query StandardOutputContent
 }
 
 case "${1:-}" in
