@@ -7,6 +7,7 @@
 #   page          affiche l'adresse de la page de demarrage/arret
 #   journal       affiche la fin des journaux d'installation et de Minecraft
 #   reinstaller   relance l'installation sur le serveur (apres un echec)
+#   relancer      redemarre Crafty (les mondes sont sauvegardes puis relances)
 #   shell         ouvre un terminal sur le serveur
 set -euo pipefail
 
@@ -37,9 +38,9 @@ remote() {
 }
 
 case "${1:-}" in
-  panneau | identifiants | demarrer | arreter | page | journal | reinstaller | shell) ;;
+  panneau | identifiants | demarrer | arreter | page | journal | reinstaller | relancer | shell) ;;
   *)
-    sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'
     exit 1
     ;;
 esac
@@ -61,5 +62,6 @@ case "$1" in
     remote "tail -n 40 /var/log/minecraft-setup.log; echo; echo '=== Crafty ==='; systemctl is-active crafty; docker ps -a --format '{{.Names}} {{.Status}}'; echo; echo '=== Minecraft ==='; tail -n 40 /opt/minecraft/crafty/servers/*/logs/latest.log"
     ;;
   reinstaller) aws ssm start-associations-once --association-ids "$(output SetupAssociationId)" && echo "Relance ; suivre avec ./admin.sh journal" ;;
+  relancer) remote "systemctl restart crafty && echo Crafty redemarre : \$(systemctl is-active crafty)" ;;
   shell) aws ssm start-session --target "$INSTANCE_ID" ;;
 esac
