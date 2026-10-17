@@ -100,6 +100,15 @@ Dans Crafty :
 La mémoire du « Monde principal » est réglée à 60 % de la RAM de l'instance. Après un changement de type
 d'instance, ajuster `-Xms`/`-Xmx` dans *Config > Server Execution Command*.
 
+## Icône et message du serveur
+
+`assets/server-icon.png` est l'icône du serveur (PNG 64×64) et `assets/motd.txt` contient la ligne `motd=`
+correspondante, avec les codes couleur Minecraft. Pour les appliquer à un monde, dans Crafty :
+
+1. onglet *Files* du monde : téléverser `server-icon.png` à la racine (à côté de `server.properties`) ;
+2. ouvrir `server.properties` et remplacer la ligne `motd=` par celle de `assets/motd.txt` ;
+3. redémarrer le monde.
+
 ## Autres commandes
 
 ```bash
