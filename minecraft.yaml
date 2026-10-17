@@ -476,17 +476,19 @@ Resources:
                           sleep 5
                         done
 
-                        # Java demande par cette version de Minecraft (version.json du jar), parmi ceux de l'image Crafty
+                        # Java demande par cette version de Minecraft (version.json du jar), parmi ceux de l'image Crafty ;
+                        # a defaut (version inconnue ou trop recente), le Java le plus recent
                         JAVA_MAJOR=$(python3 - $SEED/server.jar <<'EOF'
                     import json, sys, zipfile
                     try:
-                        print(json.load(zipfile.ZipFile(sys.argv[1]).open("version.json")).get("java_version", 8))
+                        print(int(json.load(zipfile.ZipFile(sys.argv[1]).open("version.json"))["java_version"]))
                     except Exception:
-                        print(8)
+                        print(99)
                     EOF
                     )
-                        JAVA_BIN=java
-                        for candidate in $(docker exec crafty update-alternatives --list java | sort -V); do
+                        JAVA_CANDIDATES=$(docker exec crafty update-alternatives --list java | sort -V)
+                        JAVA_BIN=$(echo "$JAVA_CANDIDATES" | tail -n 1)
+                        for candidate in $JAVA_CANDIDATES; do
                           if [ "$(echo "$candidate" | sed -E 's#.*/java-([0-9]+)-.*#\1#')" -ge "$JAVA_MAJOR" ] 2>/dev/null; then
                             JAVA_BIN=$candidate
                             break
@@ -616,13 +618,13 @@ Resources:
               return {"state": state, "ip": IP, "players": players() if state == "running" else None}
 
           def reply(code, data, kind="application/json"):
-              return {"statusCode": code, "headers": {"Content-Type": kind}, "body": data if kind == "text/html" else json.dumps(data)}
+              return {"statusCode": code, "headers": {"Content-Type": kind}, "body": data if isinstance(data, str) else json.dumps(data)}
 
           def handler(event, _context):
               method, path = event["requestContext"]["http"]["method"], event.get("rawPath", "/")
               if method == "GET":
-                  return reply(200, status()) if path == "/status" else reply(200, PAGE, "text/html")
-              try:  # le corps est envoye en text/plain par la page, donc jamais encode en base64
+                  return reply(200, status()) if path == "/status" else reply(200, PAGE, "text/html; charset=utf-8")
+              try:  # text/plain : jamais en base64
                   password = str(json.loads(event["body"])["password"]).encode()
               except Exception:
                   password = b""
@@ -637,20 +639,21 @@ Resources:
                   return reply(409, {"error": e.response["Error"]["Message"]})
               return reply(200, status())
 
-          PAGE = """<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+          # Page en ASCII seulement (entites HTML, echappements JS)
+          PAGE = r"""<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
           <title>Serveur Minecraft</title><style>:root{color-scheme:light dark}
           body{font:16px/1.5 system-ui,sans-serif;max-width:360px;margin:48px auto;padding:0 16px}
           input,button{font:inherit;width:100%;box-sizing:border-box;padding:10px;margin-top:10px}</style><h1>Serveur Minecraft</h1><p><b id=st>...</b></p><p>Adresse : <b id=ip></b></p><p id=pl></p>
-          <input type=password id=pw placeholder="Mot de passe"><button id=start disabled>Démarrer</button>
-          <button id=stop disabled>Arrêter</button><p id=msg></p><script>
-          const T={pending:"🟠 Démarrage…",running:"🟢 Allumé",stopping:"🟠 Arrêt…",stopped:"⚪ Éteint"},$=id=>document.getElementById(id);let cur={};
+          <input type=password id=pw placeholder="Mot de passe"><button id=start disabled>D&eacute;marrer</button>
+          <button id=stop disabled>Arr&ecirc;ter</button><p id=msg></p><script>
+          const T={pending:"D\u00e9marrage...",running:"Allum\u00e9",stopping:"Arr\u00eat...",stopped:"\u00c9teint"},$=id=>document.getElementById(id);let cur={};
           function show(s){cur=s;$("st").textContent=T[s.state]||s.state;$("ip").textContent=s.ip;
-          $("pl").textContent=s.state!="running"?"":s.players?s.players.online+" / "+s.players.max+" joueurs connectés":"Minecraft démarre…";
+          $("pl").textContent=s.state!="running"?"":s.players?s.players.online+" / "+s.players.max+" joueurs connect\u00e9s":"Minecraft d\u00e9marre...";
           $("start").disabled=s.state!="stopped";$("stop").disabled=s.state!="running"}
           async function refresh(){try{show(await(await fetch("status")).json())}catch(e){}}
-          async function act(a){const n=cur.players?cur.players.online:0;if(a=="stop"&&n&&!confirm(n+" joueur(s) en ligne. Arrêter quand même ?"))return;
+          async function act(a){const n=cur.players?cur.players.online:0;if(a=="stop"&&n&&!confirm(n+" joueur(s) en ligne, arr\u00eater ?"))return;
           const r=await fetch(a,{method:"POST",body:JSON.stringify({password:$("pw").value})}),d=await r.json();$("msg").textContent=r.ok?"":d.error;if(r.ok)show(d)}
-          $("start").onclick=()=>act("start");$("stop").onclick=()=>act("stop");refresh();setInterval(refresh,5000)
+          for(const a of["start","stop"])$(a).onclick=()=>act(a);refresh();setInterval(refresh,5000)
           </script>"""
 
   ControlUrl:

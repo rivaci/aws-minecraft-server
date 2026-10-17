@@ -5,7 +5,7 @@
 #   demarrer      allume le serveur
 #   arreter       eteint le serveur (les mondes sont sauvegardes)
 #   page          affiche l'adresse de la page de demarrage/arret
-#   journal       affiche la fin du journal d'installation
+#   journal       affiche la fin des journaux d'installation et de Minecraft
 #   reinstaller   relance l'installation sur le serveur (apres un echec)
 #   shell         ouvre un terminal sur le serveur
 set -euo pipefail
@@ -56,7 +56,9 @@ case "$1" in
   demarrer) aws ec2 start-instances --instance-ids "$INSTANCE_ID" --query 'StartingInstances[0].CurrentState.Name' --output text ;;
   arreter) aws ec2 stop-instances --instance-ids "$INSTANCE_ID" --query 'StoppingInstances[0].CurrentState.Name' --output text ;;
   page) output ControlPageUrl ;;
-  journal) remote "tail -n 50 /var/log/minecraft-setup.log" ;;
+  journal)
+    remote "tail -n 40 /var/log/minecraft-setup.log; echo; echo '=== Minecraft ==='; tail -n 40 /opt/minecraft/crafty/servers/*/logs/latest.log"
+    ;;
   reinstaller) aws ssm start-associations-once --association-ids "$(output SetupAssociationId)" && echo "Relance ; suivre avec ./admin.sh journal" ;;
   shell) aws ssm start-session --target "$INSTANCE_ID" ;;
 esac
