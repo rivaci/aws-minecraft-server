@@ -445,7 +445,6 @@ Resources:
                           VERSION_JSON=$(curl -fsSL --retry 10 --retry-all-errors "$VERSION_URL")
                           curl -fsSL --retry 10 --retry-all-errors -o $SEED/server.jar "$(echo "$VERSION_JSON" | jq -r .downloads.server.url)"
                           echo "$(echo "$VERSION_JSON" | jq -r .downloads.server.sha1)  $SEED/server.jar" | sha1sum -c -
-                          echo "eula=${AcceptMinecraftEula}" > $SEED/eula.txt
                           cat > $SEED/server.properties <<'EOF'
                     motd=${ServerMotd}
                     gamemode=${GameMode}
@@ -454,6 +453,8 @@ Resources:
                     EOF
                         fi
 
+                        # Crafty ne demarre un serveur que si eula.txt vaut exactement "eula=true", sans retour a la ligne
+                        printf 'eula=%s' "${AcceptMinecraftEula}" > $SEED/eula.txt
                         log "Import du monde dans Crafty"
                         python3 -c 'import shutil, sys; shutil.make_archive(sys.argv[1], "zip", sys.argv[2])' \
                           $CRAFTY/import/upload/premier-monde $SEED
@@ -503,6 +504,20 @@ Resources:
 
                       api POST /servers/"$SERVER_ID"/action/start_server || true
                       echo "$SERVER_ID" > $CRAFTY/.premier-monde-cree
+                    fi
+
+                    # ---- Mondes importes par une version precedente avec "eula=true" suivi d'un retour a la ligne :
+                    # Crafty refusait de les demarrer. On corrige, puis on relance Crafty pour le demarrage automatique.
+                    EULA_FIXED=0
+                    for EULA_FILE in "$CRAFTY"/servers/*/eula.txt; do
+                      if [ -f "$EULA_FILE" ] && grep -qix 'eula=true' "$EULA_FILE" && ! printf 'eula=true' | cmp -s - "$EULA_FILE"; then
+                        printf 'eula=true' > "$EULA_FILE"
+                        EULA_FIXED=1
+                      fi
+                    done
+                    if [ "$EULA_FIXED" = 1 ]; then
+                      log "eula.txt corrige : redemarrage de Crafty pour lancer les mondes"
+                      systemctl restart crafty
                     fi
 
                     docker image prune -f >/dev/null
