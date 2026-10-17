@@ -79,6 +79,7 @@ Minecraft met 1 à 2 minutes à être prêt. Les mondes sont sauvegardés propre
 
 ```bash
 ./admin.sh identifiants   # identifiants créés à l'installation (à changer dès la première connexion)
+./admin.sh recuperer      # mot de passe perdu : compte de secours Crafty valable 1 heure
 ./admin.sh panneau        # ouvre le tunnel, laisser le terminal ouvert
 ```
 

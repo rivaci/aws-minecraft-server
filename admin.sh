@@ -2,6 +2,7 @@
 # Raccourcis d'administration du serveur Minecraft. Usage : ./admin.sh <commande>
 #   panneau       ouvre un tunnel vers le panneau Crafty : https://localhost:8443
 #   identifiants  affiche les identifiants Crafty crees a l'installation
+#   recuperer     mot de passe Crafty perdu : cree un compte de secours valable 1 heure
 #   demarrer      allume le serveur
 #   arreter       eteint le serveur (les mondes sont sauvegardes)
 #   page          affiche l'adresse de la page de demarrage/arret
@@ -38,9 +39,9 @@ remote() {
 }
 
 case "${1:-}" in
-  panneau | identifiants | demarrer | arreter | page | journal | reinstaller | relancer | shell) ;;
+  panneau | identifiants | recuperer | demarrer | arreter | page | journal | reinstaller | relancer | shell) ;;
   *)
-    sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
     exit 1
     ;;
 esac
@@ -55,6 +56,12 @@ case "$1" in
       --parameters "{\"portNumber\":[\"8443\"],\"localPortNumber\":[\"$LOCAL_PORT\"]}"
     ;;
   identifiants) remote "/usr/local/bin/crafty-password" ;;
+  recuperer)
+    # Procedure de secours de Crafty : le compte anti-lockout-user et son mot de passe s'affichent dans sa console
+    remote "curl -sk https://127.0.0.1:8443/api/v2/crafty/resetPass; echo; sleep 2; docker logs --since 1h crafty 2>&1 | grep -A1 'Username: anti-lockout-user' | tail -n 2"
+    echo "Connecte-toi au panneau avec ce compte (valable 1 heure), puis change le mot de passe de admin :"
+    echo "Panel Settings > Users > admin > Change Password."
+    ;;
   demarrer) aws ec2 start-instances --instance-ids "$INSTANCE_ID" --query 'StartingInstances[0].CurrentState.Name' --output text ;;
   arreter) aws ec2 stop-instances --instance-ids "$INSTANCE_ID" --query 'StoppingInstances[0].CurrentState.Name' --output text ;;
   page) output ControlPageUrl ;;
